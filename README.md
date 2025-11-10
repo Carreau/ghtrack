@@ -30,21 +30,6 @@ The script will display a report showing URLs grouped by day for:
 - PRs where you pushed commits
 - PRs and issues where you commented
 
-## Example Output
-
-```
-# Friday (2025-11-07)
-- https://github.com/google/flax/pull/5079
-
-# Thursday (2025-11-06)
-- https://github.com/google/flax/pull/5069
-- https://github.com/jax-ml/jax/pull/32268
-
-# Tuesday (2025-11-04)
-- https://github.com/google/flax/issues/5067
-- https://github.com/google/flax/pull/5069
-```
-
 ## How It Works
 
 The script:

@@ -11,12 +11,25 @@ async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
     commits_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/commits"
 
     try:
-        commits_response = await client.get(commits_url)
+        # Fetch all pages of commits
+        commits = []
+        page = 1
+        while True:
+            params = {'per_page': 100, 'page': page}
+            commits_response = await client.get(commits_url, params=params)
 
-        if commits_response.status_code != 200:
-            return None
+            if commits_response.status_code != 200:
+                if page == 1:
+                    return None
+                break
 
-        commits = commits_response.json()
+            page_commits = commits_response.json()
+            if not page_commits:
+                break
+
+            commits.extend(page_commits)
+            page += 1
+
         user_commits = []
 
         for commit in commits:
@@ -92,31 +105,82 @@ async def get_pr_activity(client, nursery, username, days, all_results, search_c
             print(f"Error fetching page {page}: {e}", file=sys.stderr)
             break
 
-async def fetch_comments_for_item(client, item, username, days, is_issue=False):
+async def fetch_comments_for_item(client, item, username, days, is_issue=False, fetch_review_comments=False):
     """Fetch comments for a single PR or issue asynchronously."""
     repo = item['repository_url'].replace('https://api.github.com/repos/', '')
     number = item['number']
     comments_url = item['comments_url']
 
     try:
-        comments_response = await client.get(comments_url)
+        # Fetch all pages of regular comments
+        comments = []
+        page = 1
+        while True:
+            params = {'per_page': 100, 'page': page}
+            comments_response = await client.get(comments_url, params=params)
 
-        if comments_response.status_code != 200:
-            return None
+            if comments_response.status_code != 200:
+                if page == 1:
+                    return None
+                break
 
-        comments = comments_response.json()
+            page_comments = comments_response.json()
+            if not page_comments:
+                break
+
+            comments.extend(page_comments)
+            page += 1
+
         user_comments = []
 
         for comment in comments:
             if comment['user']['login'] == username:
                 comment_date = date_parser.isoparse(comment['created_at'])
-                if comment_date >= datetime.now(comment_date.tzinfo) - timedelta(days=days):
+                cutoff_date = datetime.now(comment_date.tzinfo) - timedelta(days=days)
+
+                if comment_date >= cutoff_date:
                     user_comments.append({
                         'date': comment_date,
                         'body': comment['body'][:100] + ('...' if len(comment['body']) > 100 else '')
                     })
 
-        if user_comments:
+        # Fetch review comments (inline code comments) for PRs
+        user_review_comments = []
+        if not is_issue and fetch_review_comments:
+            review_comments_url = f"https://api.github.com/repos/{repo}/pulls/{number}/comments"
+
+            try:
+                # Fetch all pages of review comments
+                review_comments = []
+                page = 1
+                while True:
+                    params = {'per_page': 100, 'page': page}
+                    review_response = await client.get(review_comments_url, params=params)
+
+                    if review_response.status_code != 200:
+                        break
+
+                    page_review_comments = review_response.json()
+                    if not page_review_comments:
+                        break
+
+                    review_comments.extend(page_review_comments)
+                    page += 1
+
+                for comment in review_comments:
+                    if comment['user']['login'] == username:
+                        comment_date = date_parser.isoparse(comment['created_at'])
+                        cutoff_date = datetime.now(comment_date.tzinfo) - timedelta(days=days)
+
+                        if comment_date >= cutoff_date:
+                            user_review_comments.append({
+                                'date': comment_date,
+                                'body': comment['body'][:100] + ('...' if len(comment['body']) > 100 else '')
+                            })
+            except Exception as e:
+                print(f"Error fetching review comments for {repo}#{number}: {e}", file=sys.stderr)
+
+        if user_comments or user_review_comments:
             key = f"{repo}#{number}"
             # Check if PR was merged (pull_request object has merged_at field)
             state = item['state']
@@ -132,7 +196,8 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False):
                     'url': item['html_url'],
                     'state': state,
                     'is_author': False,
-                    'comments': user_comments
+                    'comments': user_comments,
+                    'review_comments': user_review_comments
                 }
             }
             if is_issue:
@@ -165,9 +230,9 @@ async def fetch_pr_comments(client, nursery, username, since_date, days, all_res
             if not items:
                 break  # Stop pagination if page is empty
 
-            # Fetch comments for all items on this page using the parent nursery
+            # Fetch comments AND review comments for all items on this page using the parent nursery
             async def fetch_and_store(item):
-                result = await fetch_comments_for_item(client, item, username, days, False)
+                result = await fetch_comments_for_item(client, item, username, days, False, True)
                 if result:
                     all_results.append(result)
 
@@ -213,6 +278,42 @@ async def fetch_issue_comments(client, nursery, username, since_date, days, all_
             print(f"Error fetching issue comment page {page}: {e}", file=sys.stderr)
             break
 
+async def fetch_review_comments(client, nursery, username, since_date, days, all_results, search_counter):
+    """Fetch PRs where user made reviews or review comments (pages sequentially, stop when empty)."""
+    search_url = 'https://api.github.com/search/issues'
+    # Use reviewed-by OR commenter to catch all review activity
+    query = f'is:pr reviewed-by:{username} updated:>={since_date} -author:{username}'
+
+    for page in range(1, 11):
+        params = {'q': query, 'per_page': 100, 'sort': 'updated', 'order': 'desc', 'page': page}
+
+        try:
+            response = await client.get(search_url, params=params)
+            search_counter['count'] += 1
+
+            if response.status_code != 200:
+                print(f"Warning: Review comment search page {page} returned {response.status_code}", file=sys.stderr)
+                break
+
+            data = response.json()
+            items = data.get('items', [])
+
+            if not items:
+                break  # Stop pagination if page is empty
+
+            # Fetch review comments for all items on this page using the parent nursery
+            async def fetch_and_store(item):
+                result = await fetch_comments_for_item(client, item, username, days, False, True)
+                if result:
+                    all_results.append(result)
+
+            for item in items:
+                nursery.start_soon(fetch_and_store, item)
+
+        except Exception as e:
+            print(f"Error fetching review comment page {page}: {e}", file=sys.stderr)
+            break
+
 def generate_report(pr_activity, comment_activity, username):
     # Collect all activity by date
     activity_by_date = {}
@@ -221,7 +322,10 @@ def generate_report(pr_activity, comment_activity, username):
     for pr in pr_activity.values():
         url_to_info[pr['url']] = {
             'title': pr['title'],
-            'state': pr['state']
+            'state': pr['state'],
+            'commits': len(pr['commits']),
+            'comments': 0,
+            'review_comments': 0
         }
         for commit in pr['commits']:
             date = commit['date'].strftime('%Y-%m-%d')
@@ -230,15 +334,30 @@ def generate_report(pr_activity, comment_activity, username):
             activity_by_date[date].add(pr['url'])
 
     for item in comment_activity.values():
-        url_to_info[item['url']] = {
-            'title': item['title'],
-            'state': item['state']
-        }
+        url = item['url']
+        if url in url_to_info:
+            # Update existing entry (PR with both commits and comments)
+            url_to_info[url]['comments'] = len(item['comments'])
+            url_to_info[url]['review_comments'] = len(item.get('review_comments', []))
+        else:
+            # New entry (only comments, no commits)
+            url_to_info[url] = {
+                'title': item['title'],
+                'state': item['state'],
+                'commits': 0,
+                'comments': len(item['comments']),
+                'review_comments': len(item.get('review_comments', []))
+            }
         for comment in item['comments']:
             date = comment['date'].strftime('%Y-%m-%d')
             if date not in activity_by_date:
                 activity_by_date[date] = set()
-            activity_by_date[date].add(item['url'])
+            activity_by_date[date].add(url)
+        for review_comment in item.get('review_comments', []):
+            date = review_comment['date'].strftime('%Y-%m-%d')
+            if date not in activity_by_date:
+                activity_by_date[date] = set()
+            activity_by_date[date].add(url)
 
     if not activity_by_date:
         print("No activity found in the last 7 days.")
@@ -253,7 +372,23 @@ def generate_report(pr_activity, comment_activity, username):
             title = info.get('title', "")
             state = info.get('state', 'unknown')
             state_label = f"[{state}]" if state in ['closed', 'merged'] else ""
-            print(f"- {url} - {title} {state_label}")
+
+            # Build activity summary
+            activity_parts = []
+            commits = info.get('commits', 0)
+            comments = info.get('comments', 0)
+            review_comments = info.get('review_comments', 0)
+
+            if commits > 0:
+                activity_parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+            if comments > 0:
+                activity_parts.append(f"{comments} comment{'s' if comments != 1 else ''}")
+            if review_comments > 0:
+                activity_parts.append(f"{review_comments} review comment{'s' if review_comments != 1 else ''}")
+
+            activity_summary = f"({', '.join(activity_parts)})" if activity_parts else ""
+
+            print(f"- {url} - {title} {state_label} {activity_summary}")
         print()
 
 async def main():
@@ -331,6 +466,7 @@ async def main():
                 nursery.start_soon(get_pr_activity, client, nursery, username, 7, all_results, search_counter, since_date)
                 nursery.start_soon(fetch_pr_comments, client, nursery, username, since_date, 7, all_results, search_counter)
                 nursery.start_soon(fetch_issue_comments, client, nursery, username, since_date, 7, all_results, search_counter)
+                nursery.start_soon(fetch_review_comments, client, nursery, username, since_date, 7, all_results, search_counter)
 
             # Separate results into pr_activity and comment_activity
             pr_result = {}

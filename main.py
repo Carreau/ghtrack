@@ -1,10 +1,57 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from dateutil import parser as date_parser
 import httpx
 import trio
+
+
+def extract_linked_issue_refs(body, repo):
+    """Extract linked issue references from PR body using closing keywords."""
+    if not body:
+        return []
+    pattern = r'(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:([a-zA-Z0-9_.\-]+/[a-zA-Z0-9_.\-]+)#(\d+)|#(\d+))'
+    seen = set()
+    issues = []
+    for match in re.finditer(pattern, body, re.IGNORECASE):
+        cross_repo, cross_num, local_num = match.groups()
+        if cross_repo and cross_num:
+            key = (cross_repo, int(cross_num))
+        elif local_num:
+            key = (repo, int(local_num))
+        else:
+            continue
+        if key not in seen:
+            seen.add(key)
+            issues.append({'repo': key[0], 'number': key[1]})
+    return issues
+
+
+async def fetch_issue_details(client, repo, number):
+    """Fetch title, url and state for a single issue."""
+    url = f"https://api.github.com/repos/{repo}/issues/{number}"
+    try:
+        response = await client.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                'number': number,
+                'repo': repo,
+                'title': data['title'],
+                'url': data['html_url'],
+                'state': data['state'],
+            }
+    except Exception:
+        pass
+    return {
+        'number': number,
+        'repo': repo,
+        'title': '',
+        'url': f"https://github.com/{repo}/issues/{number}",
+        'state': 'unknown',
+    }
 
 async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
     """Fetch commits for a single PR asynchronously."""
@@ -49,6 +96,12 @@ async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
             if state == 'closed' and pr.get('pull_request', {}).get('merged_at'):
                 state = 'merged'
 
+            # Fetch linked issues from PR body
+            linked_issues = []
+            for ref in extract_linked_issue_refs(pr.get('body', ''), repo):
+                details = await fetch_issue_details(client, ref['repo'], ref['number'])
+                linked_issues.append(details)
+
             return {
                 'key': pr_key,
                 'data': {
@@ -59,7 +112,8 @@ async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
                     'state': state,
                     'is_author': True,
                     'commits': user_commits,
-                    'comments': []
+                    'comments': [],
+                    'linked_issues': linked_issues,
                 }
             }
     except Exception as e:
@@ -187,6 +241,13 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False, 
             if not is_issue and state == 'closed' and item.get('pull_request', {}).get('merged_at'):
                 state = 'merged'
 
+            # Fetch linked issues from PR body (not applicable for issues)
+            linked_issues = []
+            if not is_issue:
+                for ref in extract_linked_issue_refs(item.get('body', ''), repo):
+                    details = await fetch_issue_details(client, ref['repo'], ref['number'])
+                    linked_issues.append(details)
+
             result = {
                 'key': key,
                 'data': {
@@ -197,7 +258,8 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False, 
                     'state': state,
                     'is_author': False,
                     'comments': user_comments,
-                    'review_comments': user_review_comments
+                    'review_comments': user_review_comments,
+                    'linked_issues': linked_issues,
                 }
             }
             if is_issue:
@@ -325,7 +387,8 @@ def generate_report(pr_activity, comment_activity, username):
             'state': pr['state'],
             'commits': len(pr['commits']),
             'comments': 0,
-            'review_comments': 0
+            'review_comments': 0,
+            'linked_issues': pr.get('linked_issues', []),
         }
         for commit in pr['commits']:
             date = commit['date'].strftime('%Y-%m-%d')
@@ -346,7 +409,8 @@ def generate_report(pr_activity, comment_activity, username):
                 'state': item['state'],
                 'commits': 0,
                 'comments': len(item['comments']),
-                'review_comments': len(item.get('review_comments', []))
+                'review_comments': len(item.get('review_comments', [])),
+                'linked_issues': item.get('linked_issues', []),
             }
         for comment in item['comments']:
             date = comment['date'].strftime('%Y-%m-%d')
@@ -364,7 +428,7 @@ def generate_report(pr_activity, comment_activity, username):
         return
 
     # Print by day
-    for date in sorted(activity_by_date.keys(), reverse=True):
+    for date in sorted(activity_by_date.keys()):
         day_name = datetime.strptime(date, '%Y-%m-%d').strftime('%A')
         print(f"# {day_name} ({date})")
         for url in sorted(activity_by_date[date]):
@@ -389,6 +453,12 @@ def generate_report(pr_activity, comment_activity, username):
             activity_summary = f"({', '.join(activity_parts)})" if activity_parts else ""
 
             print(f"- {url} - {title} {state_label} {activity_summary}")
+            for issue in info.get('linked_issues', []):
+                issue_state = issue.get('state', '')
+                issue_state_label = f"[{issue_state}]" if issue_state in ('closed', 'open') else ""
+                issue_title = issue.get('title', '')
+                separator = ' - ' if issue_title else ''
+                print(f"  - {issue['url']}{separator}{issue_title} {issue_state_label}".rstrip())
         print()
 
 async def main():

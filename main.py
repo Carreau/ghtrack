@@ -429,7 +429,11 @@ def generate_report(pr_activity, comment_activity, username):
 
     # Print by day
     for date in sorted(activity_by_date.keys()):
-        day_name = datetime.strptime(date, '%Y-%m-%d').strftime('%A')
+        day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+        if day_name == "Monday":
+            print()
+            print("-" * 10)
+            print()
         print(f"# {day_name} ({date})")
         for url in sorted(activity_by_date[date]):
             info = url_to_info.get(url, {})
@@ -520,7 +524,7 @@ async def main():
     try:
         # Fetch PR activity and comment activity in parallel
         search_counter = {'count': 0}
-        since = (datetime.now() - timedelta(days=7)).isoformat()
+        since = (datetime.now() - timedelta(days=14)).isoformat()
         since_date = since[:10]
 
         headers = {
@@ -533,10 +537,46 @@ async def main():
 
             async with trio.open_nursery() as nursery:
                 # Start PR activity and comment activity fetchers
-                nursery.start_soon(get_pr_activity, client, nursery, username, 7, all_results, search_counter, since_date)
-                nursery.start_soon(fetch_pr_comments, client, nursery, username, since_date, 7, all_results, search_counter)
-                nursery.start_soon(fetch_issue_comments, client, nursery, username, since_date, 7, all_results, search_counter)
-                nursery.start_soon(fetch_review_comments, client, nursery, username, since_date, 7, all_results, search_counter)
+                nursery.start_soon(
+                    get_pr_activity,
+                    client,
+                    nursery,
+                    username,
+                    14,
+                    all_results,
+                    search_counter,
+                    since_date,
+                )
+                nursery.start_soon(
+                    fetch_pr_comments,
+                    client,
+                    nursery,
+                    username,
+                    since_date,
+                    14,
+                    all_results,
+                    search_counter,
+                )
+                nursery.start_soon(
+                    fetch_issue_comments,
+                    client,
+                    nursery,
+                    username,
+                    since_date,
+                    14,
+                    all_results,
+                    search_counter,
+                )
+                nursery.start_soon(
+                    fetch_review_comments,
+                    client,
+                    nursery,
+                    username,
+                    since_date,
+                    14,
+                    all_results,
+                    search_counter,
+                )
 
             # Separate results into pr_activity and comment_activity
             pr_result = {}

@@ -385,6 +385,7 @@ def generate_report(pr_activity, comment_activity, username):
         url_to_info[pr['url']] = {
             'title': pr['title'],
             'state': pr['state'],
+            'repo': pr.get('repo', ''),
             'commits': len(pr['commits']),
             'comments': 0,
             'review_comments': 0,
@@ -407,6 +408,7 @@ def generate_report(pr_activity, comment_activity, username):
             url_to_info[url] = {
                 'title': item['title'],
                 'state': item['state'],
+                'repo': item.get('repo', ''),
                 'commits': 0,
                 'comments': len(item['comments']),
                 'review_comments': len(item.get('review_comments', [])),
@@ -456,7 +458,9 @@ def generate_report(pr_activity, comment_activity, username):
 
             activity_summary = f"({', '.join(activity_parts)})" if activity_parts else ""
 
-            print(f"- {url} - {title} {state_label} {activity_summary}")
+            project = info.get('repo', '')
+            project_label = f"[{project}] " if project else ""
+            print(f"- [ ] {project_label}{url} - {title} {state_label} {activity_summary}")
             for issue in info.get('linked_issues', []):
                 issue_state = issue.get('state', '')
                 issue_state_label = f"[{issue_state}]" if issue_state in ('closed', 'open') else ""

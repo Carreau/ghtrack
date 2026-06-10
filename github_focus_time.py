@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+Report cumulative GitHub tab focus time over the last 7 days from Firefox history.
+Groups results by repository path (github.com/org/repo).
+"""
+
+import datetime
+import glob
+import shutil
+import sqlite3
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+def find_places_db() -> Path:
+    patterns = [
+        "~/.mozilla/firefox/*.default-release/places.sqlite",
+        "~/.mozilla/firefox/*.default/places.sqlite",
+        "~/.mozilla/firefox/*/places.sqlite",
+        # macOS
+        "~/Library/Application Support/Firefox/Profiles/*.default-release/places.sqlite",
+        "~/Library/Application Support/Firefox/Profiles/*.default/places.sqlite",
+        "~/Library/Application Support/Firefox/Profiles/*/places.sqlite",
+    ]
+    for pattern in patterns:
+        matches = glob.glob(str(Path(pattern).expanduser()))
+        if matches:
+            # pick the most recently modified one if multiple
+            return Path(sorted(matches, key=lambda p: Path(p).stat().st_mtime)[-1])
+    raise FileNotFoundError(
+        "Could not find Firefox places.sqlite. "
+        "Pass the path as an argument: python github_focus_time.py /path/to/places.sqlite"
+    )
+
+
+def repo_path(url: str) -> str | None:
+    """
+    Extract a GitHub path from a URL:
+    - issue/PR:  github.com/org/repo/issues/123  or  github.com/org/repo/pull/456
+    - otherwise: github.com/org/repo
+    Returns None if not a github.com URL.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+
+    host = parsed.hostname or ""
+    if "github.com" not in host:
+        return None
+
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 4 and parts[2] in ("issues", "pull"):
+        return f"github.com/{parts[0]}/{parts[1]}/{parts[2]}/{parts[3]}"
+    elif len(parts) >= 2:
+        return f"github.com/{parts[0]}/{parts[1]}"
+    elif len(parts) == 1:
+        return f"github.com/{parts[0]}"
+    else:
+        return "github.com"
+
+
+MAX_SESSION_US = 30 * 60 * 1_000_000  # cap per visit: 30 minutes in microseconds
+
+
+def has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+def query_focus_time(db_path: Path) -> dict[str, dict[str, int]]:
+    """Return {date_str: {issue_path: microseconds}}."""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+        tmp_path = tmp.name
+    shutil.copy2(db_path, tmp_path)
+
+    try:
+        con = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+
+        cutoff_us = int(__import__("time").time() - 14 * 86400) * 1_000_000
+
+        if has_column(con, "moz_historyvisits", "visit_duration"):
+            rows = con.execute("""
+                SELECT p.url, v.visit_date, v.visit_duration
+                FROM moz_historyvisits v
+                JOIN moz_places p ON p.id = v.place_id
+                WHERE p.url LIKE '%github.com%'
+                  AND v.visit_date >= ?
+                  AND v.visit_duration > 0
+                  AND v.visit_type != 9
+            """, (cutoff_us,)).fetchall()
+
+            # {date: {path: us}}
+            totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            for row in rows:
+                path = repo_path(row["url"])
+                if path:
+                    day = _us_to_date(row["visit_date"])
+                    totals[day][path] += row["visit_duration"]
+
+        else:
+            # Fallback: gap-to-next-visit, capped at 30 min, across all URLs.
+            rows = con.execute("""
+                SELECT p.url, v.visit_date
+                FROM moz_historyvisits v
+                JOIN moz_places p ON p.id = v.place_id
+                WHERE v.visit_date >= ?
+                  AND v.visit_type != 9
+                ORDER BY v.visit_date ASC
+            """, (cutoff_us,)).fetchall()
+
+            totals = defaultdict(lambda: defaultdict(int))
+            visits = [(row["url"], row["visit_date"]) for row in rows]
+            for i, (url, ts) in enumerate(visits):
+                path = repo_path(url)
+                if not path:
+                    continue
+                if i + 1 < len(visits):
+                    duration_us = min(visits[i + 1][1] - ts, MAX_SESSION_US)
+                else:
+                    duration_us = 0
+                if duration_us > 0:
+                    day = _us_to_date(ts)
+                    totals[day][path] += duration_us
+
+        con.close()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    return totals
+
+
+def _us_to_date(visit_date_us: int) -> str:
+    return datetime.datetime.utcfromtimestamp(visit_date_us / 1_000_000).strftime("%Y-%m-%d")
+
+
+def fmt_duration(microseconds: int) -> str:
+    seconds = microseconds // 1_000_000
+    h, remainder = divmod(seconds, 3600)
+    m, s = divmod(remainder, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    elif m:
+        return f"{m}m {s:02d}s"
+    else:
+        return f"{s}s"
+
+
+def main():
+    if len(sys.argv) > 1:
+        db_path = Path(sys.argv[1])
+    else:
+        try:
+            db_path = find_places_db()
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Reading: {db_path}\n")
+
+    totals = query_focus_time(db_path)
+
+    if not totals:
+        print("No GitHub visits with focus-time data found in the last 7 days.")
+        print("(visit_duration may be 0 if Firefox wasn't closed cleanly after visits)")
+        return
+
+    grand_total = 0
+    for day in sorted(totals):
+        day_entries = sorted(totals[day].items(), key=lambda x: x[0])
+        day_total = sum(us for _, us in day_entries)
+        grand_total += day_total
+
+        weekday = datetime.datetime.strptime(day, "%Y-%m-%d").strftime("%A")
+        print(f"\n## {day} {weekday} — {fmt_duration(day_total)}\n")
+        for path, us in day_entries:
+            url = f"https://{path}"
+            parts = path.split("/")
+            org_repo = f"`{parts[1]}/{parts[2]}`" if len(parts) >= 3 else f"`{path}`"
+            print(f"- [ ] {org_repo}")
+            print(f"  [{path}]({url}) — {fmt_duration(us)}")
+
+    print(f"\n**Total: {fmt_duration(grand_total)}**")
+
+
+if __name__ == "__main__":
+    main()

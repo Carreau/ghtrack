@@ -181,7 +181,7 @@ def main():
             url = f"https://{path}"
             parts = path.split("/")
             org_repo = f"`{parts[1]}/{parts[2]}`" if len(parts) >= 3 else f"`{path}`"
-            print(f"- [ ] {org_repo}")
+            print(f"- [ ] {org_repo}", end="")
             print(f"  [{path}]({url}) — {fmt_duration(us)}")
 
     print(f"\n**Total: {fmt_duration(grand_total)}**")

@@ -1,0 +1,11 @@
+# ghtrack config — copy to `ghtrack.toml` (in the working dir) or
+# `~/.config/ghtrack/config.toml`.
+#
+# `ignore` is a list of URL glob patterns (case-insensitive). Any visit whose
+# URL matches a pattern is excluded from the focus-time report.
+ignore = [
+    "*://github.com/notifications*",
+    "*://github.com/settings*",
+    "*://github.com/orgs/*",
+    "*github.com/some-org/noisy-repo*",
+]

@@ -42,3 +42,28 @@ The script:
 Your token needs:
 - `repo` scope for private repositories
 - `public_repo` scope if you only work with public repositories
+
+## Firefox focus time
+
+`github_focus_time.py` reports cumulative GitHub tab focus time over the last
+days from your Firefox history, grouped by repository:
+
+```
+python github_focus_time.py [/path/to/places.sqlite]
+```
+
+### Ignoring URLs
+
+To exclude some URLs from the report, create a config file at either
+`ghtrack.toml` (in the working directory) or `~/.config/ghtrack/config.toml`.
+See `ghtrack.toml.example` for the format:
+
+```toml
+ignore = [
+    "*://github.com/notifications*",
+    "*://github.com/settings*",
+]
+```
+
+`ignore` is a list of case-insensitive URL glob patterns; any visit whose URL
+matches a pattern is excluded.

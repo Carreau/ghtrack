@@ -93,7 +93,9 @@ async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
             pr_key = f"{repo}#{pr_number}"
             # Check if PR was merged (pull_request object has merged_at field)
             state = pr['state']
-            if state == 'closed' and pr.get('pull_request', {}).get('merged_at'):
+            merged_at = pr.get('pull_request', {}).get('merged_at')
+            merged_date = date_parser.isoparse(merged_at).strftime('%Y-%m-%d') if merged_at else None
+            if state == 'closed' and merged_at:
                 state = 'merged'
 
             # Fetch linked issues from PR body
@@ -110,6 +112,8 @@ async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
                     'title': pr['title'],
                     'url': pr['html_url'],
                     'state': state,
+                    'is_pr': True,
+                    'merged_date': merged_date,
                     'is_author': True,
                     'commits': user_commits,
                     'comments': [],
@@ -238,7 +242,9 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False, 
             key = f"{repo}#{number}"
             # Check if PR was merged (pull_request object has merged_at field)
             state = item['state']
-            if not is_issue and state == 'closed' and item.get('pull_request', {}).get('merged_at'):
+            merged_at = item.get('pull_request', {}).get('merged_at') if not is_issue else None
+            merged_date = date_parser.isoparse(merged_at).strftime('%Y-%m-%d') if merged_at else None
+            if not is_issue and state == 'closed' and merged_at:
                 state = 'merged'
 
             # Fetch linked issues from PR body (not applicable for issues)
@@ -256,6 +262,8 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False, 
                     'title': item['title'],
                     'url': item['html_url'],
                     'state': state,
+                    'is_pr': not is_issue,
+                    'merged_date': merged_date,
                     'is_author': False,
                     'comments': user_comments,
                     'review_comments': user_review_comments,
@@ -376,6 +384,103 @@ async def fetch_review_comments(client, nursery, username, since_date, days, all
             print(f"Error fetching review comment page {page}: {e}", file=sys.stderr)
             break
 
+async def fetch_actions_for_item(client, item, username, days):
+    """Fetch close/merge/reopen actions performed by the user on a single issue/PR."""
+    repo = item['repository_url'].replace('https://api.github.com/repos/', '')
+    number = item['number']
+    is_issue = 'pull_request' not in item
+    events_url = f"https://api.github.com/repos/{repo}/issues/{number}/events"
+
+    actions = []
+    try:
+        for page in range(1, 11):
+            params = {'per_page': 100, 'page': page}
+            response = await client.get(events_url, params=params)
+            if response.status_code != 200:
+                break
+
+            events = response.json()
+            if not events:
+                break
+
+            for event in events:
+                actor = event.get('actor') or {}
+                if actor.get('login') != username:
+                    continue
+                if event.get('event') not in ('closed', 'merged', 'reopened'):
+                    continue
+
+                event_date = date_parser.isoparse(event['created_at'])
+                cutoff_date = datetime.now(event_date.tzinfo) - timedelta(days=days)
+                if event_date >= cutoff_date:
+                    actions.append({'date': event_date, 'type': event['event']})
+    except Exception as e:
+        print(f"Error fetching events for {repo}#{number}: {e}", file=sys.stderr)
+        return None
+
+    if not actions:
+        return None
+
+    state = item['state']
+    merged_at = item.get('pull_request', {}).get('merged_at') if not is_issue else None
+    merged_date = date_parser.isoparse(merged_at).strftime('%Y-%m-%d') if merged_at else None
+    if not is_issue and state == 'closed' and merged_at:
+        state = 'merged'
+
+    return {
+        'key': f"{repo}#{number}",
+        'data': {
+            'repo': repo,
+            'number': number,
+            'title': item['title'],
+            'url': item['html_url'],
+            'state': state,
+            'is_pr': not is_issue,
+            'merged_date': merged_date,
+            'is_author': False,
+            'comments': [],
+            'review_comments': [],
+            'actions': actions,
+            'linked_issues': [],
+        }
+    }
+
+async def fetch_closed_by_user(client, nursery, username, since_date, days, all_results, search_counter):
+    """Fetch issues/PRs the user closed/merged/reopened (verified via the events API)."""
+    search_url = 'https://api.github.com/search/issues'
+    # Search has no "closed-by" qualifier, so find recently-closed items the user is
+    # involved with, then confirm the user was the actor via each item's event timeline.
+    query = f'involves:{username} closed:>={since_date}'
+
+    for page in range(1, 11):
+        params = {'q': query, 'per_page': 100, 'sort': 'updated', 'order': 'desc', 'page': page}
+
+        try:
+            response = await client.get(search_url, params=params)
+            search_counter['count'] += 1
+
+            if response.status_code != 200:
+                print(f"Warning: closed-by-user search page {page} returned {response.status_code}", file=sys.stderr)
+                break
+
+            data = response.json()
+            items = data.get('items', [])
+
+            if not items:
+                break  # Stop pagination if page is empty
+
+            async def fetch_and_store(item):
+                result = await fetch_actions_for_item(client, item, username, days)
+                if result:
+                    all_results.append(result)
+
+            for item in items:
+                nursery.start_soon(fetch_and_store, item)
+
+        except Exception as e:
+            print(f"Error fetching closed-by-user page {page}: {e}", file=sys.stderr)
+            break
+
 def generate_report(pr_activity, comment_activity, username):
     # Collect all activity by date
     activity_by_date = {}
@@ -386,9 +491,12 @@ def generate_report(pr_activity, comment_activity, username):
             'title': pr['title'],
             'state': pr['state'],
             'repo': pr.get('repo', ''),
+            'is_pr': pr.get('is_pr', False),
+            'merged_date': pr.get('merged_date'),
             'commits': len(pr['commits']),
             'comments': 0,
             'review_comments': 0,
+            'actions': pr.get('actions', []),
             'linked_issues': pr.get('linked_issues', []),
         }
         for commit in pr['commits']:
@@ -403,15 +511,20 @@ def generate_report(pr_activity, comment_activity, username):
             # Update existing entry (PR with both commits and comments)
             url_to_info[url]['comments'] = len(item['comments'])
             url_to_info[url]['review_comments'] = len(item.get('review_comments', []))
+            if item.get('actions'):
+                url_to_info[url]['actions'] = item['actions']
         else:
             # New entry (only comments, no commits)
             url_to_info[url] = {
                 'title': item['title'],
                 'state': item['state'],
                 'repo': item.get('repo', ''),
+                'is_pr': item.get('is_pr', False),
+                'merged_date': item.get('merged_date'),
                 'commits': 0,
                 'comments': len(item['comments']),
                 'review_comments': len(item.get('review_comments', [])),
+                'actions': item.get('actions', []),
                 'linked_issues': item.get('linked_issues', []),
             }
         for comment in item['comments']:
@@ -421,6 +534,11 @@ def generate_report(pr_activity, comment_activity, username):
             activity_by_date[date].add(url)
         for review_comment in item.get('review_comments', []):
             date = review_comment['date'].strftime('%Y-%m-%d')
+            if date not in activity_by_date:
+                activity_by_date[date] = set()
+            activity_by_date[date].add(url)
+        for action in item.get('actions', []):
+            date = action['date'].strftime('%Y-%m-%d')
             if date not in activity_by_date:
                 activity_by_date[date] = set()
             activity_by_date[date].add(url)
@@ -437,36 +555,53 @@ def generate_report(pr_activity, comment_activity, username):
             print("-" * 10)
             print()
         print(f"# {day_name} ({date})")
+
+        # Group the day's activity by repo
+        by_repo = {}
         for url in sorted(activity_by_date[date]):
             info = url_to_info.get(url, {})
-            title = info.get('title', "")
-            state = info.get('state', 'unknown')
-            state_label = f"[{state}]" if state in ['closed', 'merged'] else ""
+            repo = info.get('repo', '')
+            by_repo.setdefault(repo, []).append((url, info))
 
-            # Build activity summary
-            activity_parts = []
-            commits = info.get('commits', 0)
-            comments = info.get('comments', 0)
-            review_comments = info.get('review_comments', 0)
+        for repo in sorted(by_repo.keys()):
+            repo_label = f"[{repo}]" if repo else "[unknown]"
+            print(f"- [ ] {repo_label}")
+            for url, info in by_repo[repo]:
+                title = info.get('title', "")
+                state = info.get('state', 'unknown')
+                state_label = f"[{state}]" if state in ['closed', 'merged'] else ""
 
-            if commits > 0:
-                activity_parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
-            if comments > 0:
-                activity_parts.append(f"{comments} comment{'s' if comments != 1 else ''}")
-            if review_comments > 0:
-                activity_parts.append(f"{review_comments} review comment{'s' if review_comments != 1 else ''}")
+                # Build activity summary
+                activity_parts = []
+                commits = info.get('commits', 0)
+                comments = info.get('comments', 0)
+                review_comments = info.get('review_comments', 0)
 
-            activity_summary = f"({', '.join(activity_parts)})" if activity_parts else ""
+                if commits > 0:
+                    activity_parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+                if comments > 0:
+                    activity_parts.append(f"{comments} comment{'s' if comments != 1 else ''}")
+                if review_comments > 0:
+                    activity_parts.append(f"{review_comments} review comment{'s' if review_comments != 1 else ''}")
 
-            project = info.get('repo', '')
-            project_label = f"[{project}] " if project else ""
-            print(f"- [ ] {project_label}{url} - {title} {state_label} {activity_summary}")
-            for issue in info.get('linked_issues', []):
-                issue_state = issue.get('state', '')
-                issue_state_label = f"[{issue_state}]" if issue_state in ('closed', 'open') else ""
-                issue_title = issue.get('title', '')
-                separator = ' - ' if issue_title else ''
-                print(f"  - {issue['url']}{separator}{issue_title} {issue_state_label}".rstrip())
+                # Actions (close/merge/reopen) the user performed on this day
+                day_actions = [a['type'] for a in info.get('actions', [])
+                               if a['date'].strftime('%Y-%m-%d') == date]
+                for action_type in sorted(set(day_actions)):
+                    activity_parts.append(action_type)
+
+                activity_summary = f"({', '.join(activity_parts)})" if activity_parts else ""
+
+                # Mark with √ when this is a PR and the day matches its merge day
+                is_merged_today = info.get('is_pr') and info.get('merged_date') == date
+                merge_mark = "√ " if is_merged_today else ""
+                print(f"  - [ ] {merge_mark}{url} - {title} {state_label} {activity_summary}".rstrip())
+                for issue in info.get('linked_issues', []):
+                    issue_state = issue.get('state', '')
+                    issue_state_label = f"[{issue_state}]" if issue_state in ('closed', 'open') else ""
+                    issue_title = issue.get('title', '')
+                    separator = ' - ' if issue_title else ''
+                    print(f"    - {issue['url']}{separator}{issue_title} {issue_state_label}".rstrip())
         print()
 
 async def main():
@@ -581,16 +716,36 @@ async def main():
                     all_results,
                     search_counter,
                 )
+                nursery.start_soon(
+                    fetch_closed_by_user,
+                    client,
+                    nursery,
+                    username,
+                    since_date,
+                    14,
+                    all_results,
+                    search_counter,
+                )
 
             # Separate results into pr_activity and comment_activity
             pr_result = {}
             comment_result = {}
             for result in all_results:
                 data = result['data']
+                key = result['key']
                 if data.get('is_author'):
-                    pr_result[result['key']] = data
+                    pr_result[key] = data
+                elif key in comment_result:
+                    # Same item found by multiple fetchers (e.g. commented AND closed) —
+                    # merge activity instead of overwriting.
+                    existing = comment_result[key]
+                    existing['comments'].extend(data.get('comments', []))
+                    existing['review_comments'].extend(data.get('review_comments', []))
+                    existing.setdefault('actions', []).extend(data.get('actions', []))
+                    if data.get('linked_issues'):
+                        existing['linked_issues'] = data['linked_issues']
                 else:
-                    comment_result[result['key']] = data
+                    comment_result[key] = data
 
         print(f"Total search requests made: {search_counter['count']}", file=sys.stderr)
         print(file=sys.stderr)
